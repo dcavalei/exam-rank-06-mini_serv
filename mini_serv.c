@@ -7,86 +7,127 @@
 #include <stdio.h>
 #include <fcntl.h>
 
-void fatal_error() {
-    write(STDERR_FILENO, "Fatal error\n", strlen("Fatal error\n"));
+
+// REMOVED HEAP MEMORY ALLOCATION!!!
+// This version simply puts (*buf) pointing to the remaining buffer and (*msg)
+// to the message without the '\n'. It will swap the newline by a '\0'.
+int extract_message(char **buf, char **msg)
+{
+    char	*newbuf;
+    int	i;
+
+    *msg = 0;
+    if (*buf == 0)
+        return (0);
+    i = 0;
+    while ((*buf)[i])
+    {
+        if ((*buf)[i] == '\n')
+        {
+            *msg = *buf;
+            (*msg)[i] = 0;
+            *buf = *buf + i + 1;
+            return (1);
+        }
+        i++;
+    }
+    return (0);
+}
+
+char *str_join(char *buf, char *add)
+{
+    char	*newbuf;
+    int		len;
+
+    if (buf == 0)
+        len = 0;
+    else
+        len = strlen(buf);
+    newbuf = malloc(sizeof(*newbuf) * (len + strlen(add) + 1));
+    if (newbuf == 0)
+        return (0);
+    newbuf[0] = 0;
+    if (buf != 0)
+        strcat(newbuf, buf);
+    free(buf);
+    strcat(newbuf, add);
+    return (newbuf);
+}
+
+void fatal_error(void) {
+    write(2, "Fatal error\n", strlen("Fatal error\n"));
     exit(1);
 }
 
-void notify(fd_set const *managed_fds, int highest_fd, int sockfd, char const *msg) {
-    for (int fd = sockfd + 1; fd < highest_fd + 1; ++fd) {
-        if (FD_ISSET(fd, managed_fds)) {
-            size_t bytes_sent = 0;
-            size_t msg_len = strlen(msg);
-            while ((bytes_sent += send(fd, msg + bytes_sent, strlen(msg + bytes_sent), 0)) < msg_len);
-            printf("client[%d] has been notified:\n{%s}\n", fd, msg);
-        }
+fd_set fds, readfds, writefds;
+int max_fd, next_id;
+int ids[2000];
+char buffer[65000];
+char buffer_tmp[65000];
+
+void notify(char *msg, int self) {
+    for (int fd = 0; fd <= max_fd; fd++) {
+        if (FD_ISSET(fd, &writefds) == 0 || fd == self) { continue; }
+        send(fd, msg, strlen(msg), 0);
     }
 }
 
 int main(int ac, char **av) {
-    if (ac != 2) {
-        write(STDERR_FILENO, "Wrong number of arguments\n", strlen("Wrong number of arguments\n"));
-        exit(1);
-    }
+    if (ac != 2) { write(2, "Wrong number of arguments\n", strlen("Wrong number of arguments\n")); exit(1); }
     int sockfd, connfd, len;
     struct sockaddr_in servaddr, cli;
-
-    // socket create and verification
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd == -1) fatal_error();
+    if (sockfd == -1) { fatal_error(); }
     bzero(&servaddr, sizeof(servaddr));
-
-    // assign IP, PORT
     servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = htonl(2130706433); // 127.0.0.1
+    servaddr.sin_addr.s_addr = htonl(2130706433); //127.0.0.1
     servaddr.sin_port = htons(atoi(av[1]));
+    if ((bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) { fatal_error(); }
+    if (listen(sockfd, 10) != 0) { fatal_error(); }
 
-    // Binding newly created socket to given IP and verification
-    if ((bind(sockfd, (const struct sockaddr *) &servaddr, sizeof(servaddr))) != 0) fatal_error();
-    if (listen(sockfd, 10) != 0) fatal_error();
-
-    fd_set managed_fds, ready_fds;
-    FD_ZERO(&managed_fds);
-    FD_SET(sockfd, &managed_fds);
-    int highest_fd = sockfd;
-    int next_id = 0;
-    // Since we don't have access to more advanced data structures, let's sacrifice space and lower the complexity...
-    int client_id[FD_SETSIZE + 32] = {0};
-    char buffer[1024 * 10] = {0};
-    char msg[sizeof(buffer) + 64] = {0};
-
+    FD_ZERO(&fds);
+    FD_SET(sockfd, &fds);
+    max_fd = sockfd;
     while (1) {
-        ready_fds = managed_fds;
-        printf("waiting for events...\n");
-        if (select(highest_fd + 1, &ready_fds, NULL, NULL, NULL) < 0) fatal_error();
-        for (int fd = 0; fd < highest_fd + 1; ++fd) {
-            if (!FD_ISSET(fd, &ready_fds)) continue; // Filter unwanted fds
-            if (fd == sockfd) {
+        readfds = writefds = fds;
+        if (select(max_fd+1, &readfds, &writefds, 0, 0) < 0) { fatal_error(); }
+        for (int fd = 0; fd <= max_fd; fd++) {
+            if (FD_ISSET(fd, &readfds) == 0) { continue; }
+            if (fd == sockfd) { // new client
                 len = sizeof(cli);
-                if ((connfd = accept(sockfd, (struct sockaddr *) &cli, &len)) < 0) fatal_error();
-                if (highest_fd < connfd)
-                    highest_fd = connfd;
-                client_id[connfd] = next_id++;
-                printf("new connection... client with fd[%d] and id[%d]\n", connfd, client_id[connfd]);
-                sprintf(msg, "server: client %d just arrived\n", client_id[connfd]);
-                notify(&managed_fds, highest_fd, sockfd, msg);
-                // For testing only, not allowed in the exam... otherwise send/recv will block when reading from connfd
+                connfd = accept(sockfd, (struct sockaddr *)&cli, &len);
+                if (connfd < 0) { fatal_error(); }
+                if (max_fd < connfd) { max_fd = connfd; } // +1 to max_fd
+
+                ids[connfd] = next_id++; // set client id
+                char msg[128] = {0};
+                sprintf(msg, "server: client %d just arrived\n", ids[connfd]);
+                notify(msg, -1);
                 fcntl(connfd, F_SETFL, O_NONBLOCK);
-                FD_SET(connfd, &managed_fds);
-            } else {
-                long recv_bytes, total_bytes = 0;
-                while ((recv_bytes = recv(fd, buffer + total_bytes, sizeof(buffer) - total_bytes, 0)) > 0)
-                    total_bytes += recv_bytes;
-                if (total_bytes) {
-                    sprintf(msg, "client %d: %s\n", client_id[fd], buffer);
-                    notify(&managed_fds, highest_fd, sockfd, msg);
-                } else {
-                    FD_CLR(fd, &managed_fds);
-                    close(fd); // we don't want to leak fds :^)
-                    printf("client with fd[%d] and id[%d] disconnected...\n", fd, client_id[fd]);
-                    sprintf(msg, "server: client %d just left\n", client_id[fd]);
-                    notify(&managed_fds, highest_fd, sockfd, msg);
+                FD_SET(connfd, &fds);
+            } else { // old client
+                int bytes, total = 0;
+                while ((bytes = recv(fd, buffer + total, sizeof(buffer) - total, 0)) > 0) { total += bytes; }
+                if (total > 0) { // new msg
+                    char *msg = 0; char *ret = 0; char *buf = buffer;
+
+                    while (extract_message(&buf, &msg)) {
+                        sprintf(buffer_tmp, "client %d: %s\n", ids[fd], msg);
+                        ret = str_join(ret, buffer_tmp);
+                        bzero(buffer_tmp, strlen(buffer_tmp));
+                    }
+
+                    notify(ret, fd);
+                    free(ret);
+                } else { // close conn
+                    char msg[128] = {0};
+                    sprintf(msg, "server: client %d just left\n", ids[fd]);
+                    notify(msg, fd);
+
+                    FD_CLR(fd, &fds);
+                    close(fd);
                 }
+                bzero(buffer, strlen(buffer));
             }
         }
     }
